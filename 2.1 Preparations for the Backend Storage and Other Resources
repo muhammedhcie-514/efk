@@ -1,0 +1,122 @@
+Step 1 Create a resource pool in Ceph.
+Create resources pools for the efk CephFS file system.
+ceph osd pool create efk_data
+ceph osd pool create efk_metadata
+ceph fs new efk efk_metadata efk_data
+ceph orch apply mds efk --placement="2"
+Step 2 Create a namespace and directory.
+To isolate resources, create a separate namespace (logging) for this exercise.
+kubectl create ns logging
+Create a directory for storing all YAML files for this exercise.
+mkdir /root/logging
+All subsequent files and directories will be created in /root/logging.
+Step 3 Prepare StorageClass files.
+Create directory sc within /root/logging.
+mkdir sc
+Copy the StorageClass YAML files to this directory.
+cp /root/ceph/ceph-csi/deploy/cephfs/kubernetes/* ~/logging/sc/
+cp /root/ceph/ceph-csi/examples/cephfs/secret.yaml ~/logging/sc/
+Note: If you have not already, clone the Ceph CSI repository by running git clone
+https://gitee.com/yftyxa/ceph-csi.git.
+Step 4 Create ConfigMaps.
+You can reuse the ConfigMap YAML files created in previous exercises. Otherwise, create
+them using the following templates. Replace the bold text with actual configuration
+values. Set the namespace for these ConfigMaps to logging.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+ name: "ceph-csi-config"
+data:
+ config.json: |-
+ [
+ {
+ "clusterID": "88ab034c-a622-11ee-9a8c-000c2905539b",
+ "monitors": [
+ "192.168.1.11:6789",
+ "192.168.1.12:6789",
+ "192.168.1.13:6789"
+ ]
+ }
+ ]
+---
+apiVersion: v1
+kind: ConfigMap
+data:
+ config.json: |-
+ {}
+metadata:
+ name: ceph-csi-encryption-kms-config
+---
+apiVersion: v1
+kind: ConfigMap
+data:
+ ceph.conf: |
+ [global]
+ auth_cluster_required = cephx
+ auth_service_required = cephx
+ auth_client_required = cephx
+ keyring: |
+metadata:
+ name: ceph-config
+
+
+
+
+
+
+Step 5 Create a secret.
+Modify the following secret.yaml file, replacing the bold text with your actual
+information. Then, deploy the secret.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+ name: efk-secret
+ namespace: logging
+stringData:
+# Required for statically provisioned volumes
+ userID: efk
+ userKey: AQDluLxlbrvxJxAAIe1koTjcE5fJlFIWYNC1hQ==
+ # Required for dynamically provisioned volumes
+ adminID: admin
+ adminKey: AQBvgI5lqanTKhAAwyKQaG7i340SPTMTLBF7kQ==
+ # Encryption passphrase
+ encryptionPassphrase: test_passphrase
+
+Step 6 (Optional) Deploy Ceph CSI.
+You can reuse an existing Ceph CSI deployment for this exercise.
+Modify the namespace information in csi-provisioner-rbac.yaml, csi-nodepluginrbac.yaml, csi-rbdplugin-provisioner.yaml, and csi-rbdplugin.yaml from default to
+logging. You are advised to use sed for bulk replacement and verify using grep to ensure
+no instances of namespace: default remain. After modifying the files, deploy Ceph CSI
+using the following command:
+kubectl apply -f csi-nodeplugin-rbac.yaml -f csi-provisioner-rbac.yaml -f csi-cephfspluginprovisioner.yaml -f csi-cephfsplugin.yaml -f csidirver.yaml
+
+
+
+
+Step 7 Create a StorageClass.
+Create a StorageClass using the following YAML file:
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+name: efk-sc
+namespace: logging
+provisioner: cephfs.csi.ceph.com
+parameters:
+clusterID: 88ab034c-a622-11ee-9a8c-000c2905539b
+fsName: efk
+pool: efk_data
+csi.storage.k8s.io/provisioner-secret-name: efk-secret
+csi.storage.k8s.io/provisioner-secret-namespace: logging
+csi.storage.k8s.io/controller-expand-secret-name: efk-secret
+csi.storage.k8s.io/controller-expand-secret-namespace: logging
+csi.storage.k8s.io/node-stage-secret-name: efk-secret
+csi.storage.k8s.io/node-stage-secret-namespace: logging
+mounter: kernel
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+
+
+
