@@ -1,0 +1,321 @@
+Step 1 Create a directory for storing Fluentd YAML files.
+mkdir fluente 
+cd fluente
+pwd
+
+
+Step 2 Deploy Fluentd.
+Create a fluentd-configmap.yaml file with the following content:
+kind: ConfigMap
+apiVersion: v1
+metadata:
+ name: fluentd-config
+namespace: logging
+data:
+ system.conf: |-
+ <system>
+ root_dir /tmp/fluentd-buffers/
+ </system>
+ containers.input.conf: |-
+ <source>
+ @id fluentd-containers.log
+ @type tail # Fluentd built-in input type
+ path /var/log/containers/*.log # Mounted Docker container log directory
+ pos_file /var/log/es-containers.log.pos
+ tag raw.kubernetes.* # Sets the log tag.
+ read_from_head true
+ <parse> # Formats multiple lines into JSON.
+ @type multi_format # Uses the multi-format-parser plugin.
+ <pattern>
+ format json # JSON parser
+ time_key time # Specifies the "time" field for the event time.
+ time_format %Y-%m-%dT%H:%M:%S.%NZ # Time format
+ </pattern>
+ <pattern>
+ format /^(?<time>.+) (?<stream>stdout|stderr) [^ ]* (?<log>.*)$/
+ time_format %Y-%m-%dT%H:%M:%S.%N%:z
+ </pattern>
+ </parse>
+ </source>
+ # Detects exceptions in log output and forwards them as a log entry.
+ # https://github.com/GoogleCloudPlatform/fluent-plugin-detect-exceptions
+ <match raw.kubernetes.**> # Matches log information with the "raw.kubernetes.**" tag.
+ @id raw.kubernetes
+ @type detect_exceptions # Uses the detect-exceptions plugin to process exception
+stack information.
+ remove_tag_prefix raw # Removes the "raw" prefix from the tag.
+ message log
+ stream stream
+ multiline_flush_interval 5
+ max_bytes 500000
+ max_lines 1000
+ </match>
+ <filter **> # Concatenates logs.
+ @id filter_concat
+ @type concat # Fluentd Filter plugin used to concatenate multiline logs split
+across multiple events
+ key message
+ multiline_end_regexp /\n$/ # Concatenates lines using newline character "\n" as the delimiter.
+ separator ""
+</filter>
+ # Adds Kubernetes metadata data.
+ <filter kubernetes.**>
+ @id filter_kubernetes_metadata
+ @type kubernetes_metadata
+ </filter>
+ # Repairs JSON fields in Elasticsearch.
+ # Plugin address: https://github.com/repeatedly/fluent-plugin-multi-format-parser
+ <filter kubernetes.**>
+ @id filter_parser
+ @type parser # multi-format-parser plugin
+ key_name log # Field name to parse within the log record
+ reserve_data true # Retains original key-value pairs in parsed results.
+ remove_key_name_field true # Removes the "key_name" field after successful parsing.
+ <parse>
+ @type multi_format
+ <pattern>
+ format json
+ </pattern>
+ <pattern>
+ format none
+ </pattern>
+ </parse>
+ </filter>
+ # Removes some redundant attributes.
+ <filter kubernetes.**>
+ @type record_transformer
+ remove_keys
+$.docker.container_id,$.kubernetes.container_image_id,$.kubernetes.pod_id,$.kubernetes.namespace_id,$.
+kubernetes.master_url,$.kubernetes.labels.pod-template-hash
+ </filter>
+ # Keeps only the logs of pods with the "logging=true" label.
+ <filter kubernetes.**>
+ @id filter_log
+ @type grep
+ <regexp>
+ key $.kubernetes.labels.logging
+ pattern ^true$
+ </regexp>
+ </filter>
+
+ ###### Listening configuration, generally used for log aggregation ######
+ forward.input.conf: |-
+ # Listens for messages sent via TCP.
+<source>
+ @id forward
+ @type forward
+ </source>
+ output.conf: |-
+ <match **>
+ @id elasticsearch
+ @type elasticsearch
+ @log_level info
+ include_tag_key true
+ host elasticsearch
+ port 9200
+ logstash_format true
+ logstash_prefix k8s # Sets the index prefix to "k8s".
+ request_timeout 30s
+ <buffer>
+ @type file
+ path /var/log/fluentd-buffers/kubernetes.system.buffer
+ flush_mode interval
+ retry_type exponential_backoff
+ flush_thread_count 2
+ flush_interval 5s
+ retry_forever
+ retry_max_interval 30
+ chunk_limit_size 2M
+ queue_limit_length 8
+ overflow_action block
+ </buffer>
+ </match>
+
+
+Create a fluentd-daemonset.yaml file with the following content:
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+ name: fluentd-es
+ namespace: logging
+ labels:
+ k8s-app: fluentd-es
+ kubernetes.io/cluster-service: "true"
+ addonmanager.kubernetes.io/mode: Reconcile
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+ name: fluentd-es
+ labels:
+ k8s-app: fluentd-es
+kubernetes.io/cluster-service: "true"
+ addonmanager.kubernetes.io/mode: Reconcile
+rules:
+- apiGroups:
+ - ""
+ resources:
+ - "namespaces"
+ - "pods"
+ verbs:
+ - "get"
+ - "watch"
+ - "list"
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+ name: fluentd-es
+ labels:
+ k8s-app: fluentd-es
+ kubernetes.io/cluster-service: "true"
+ addonmanager.kubernetes.io/mode: Reconcile
+subjects:
+- kind: ServiceAccount
+ name: fluentd-es
+ namespace: logging
+ apiGroup: ""
+roleRef:
+ kind: ClusterRole
+ name: fluentd-es
+ apiGroup: ""
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+ name: fluentd-es
+ namespace: logging
+ labels:
+ k8s-app: fluentd-es
+ kubernetes.io/cluster-service: "true"
+ addonmanager.kubernetes.io/mode: Reconcile
+spec:
+ selector:
+ matchLabels:
+ k8s-app: fluentd-es
+ template:
+ metadata:
+ labels:
+ k8s-app: fluentd-es
+kubernetes.io/cluster-service: "true"
+ # This annotation ensures that Fluentd is not evicted even if the node is evicted, supporting critical
+pod annotation-based priority schemes.
+ annotations:
+ scheduler.alpha.kubernetes.io/critical-pod: ''
+ spec:
+ serviceAccountName: fluentd-es
+ containers:
+ - name: fluentd-es
+ image: swr.cn-east-3.myhuaweicloud.com/hcie_openeuler/fluentd:v3.4.0
+ env:
+ - name: FLUENTD_ARGS
+ value: --no-supervisor -q
+ resources:
+ limits:
+ memory: 500Mi
+ requests:
+ cpu: 100m
+ memory: 200Mi
+ volumeMounts:
+ - name: varlog
+ mountPath: /var/log
+ - name: varlibdockercontainers
+ mountPath: /var/lib/docker/containers
+ readOnly: true
+ readOnly: true
+ - name: config-volume
+ mountPath: /etc/fluent/config.d
+ #nodeSelector:
+ # beta.kubernetes.io/fluentd-ds-ready: "true"
+ tolerations:
+ - operator: Exists
+ terminationGracePeriodSeconds: 30
+ volumes:
+ - name: varlog
+ hostPath:
+ path: /var/log
+ - name: varlibdockercontainers
+ hostPath:
+ path: /var/lib/docker/containers
+ - name: config-volume
+ configMap:
+ name: fluentd-config
+
+
+Create the ConfigMap object and DaemonSet.
+kubectl create -f fluentd-configmap.yaml
+kubectl create -f fluentd-daemonset.yaml
+
+
+After the creation is complete, view the pod list to check whether the deployment is
+successful.
+kubectl get pods -n logging
+
+
+Note: Six Fluentd pods are distributed on the three masters and three nodes of the
+Kubernetes cluster.
+Step 3 Test the deployment.
+Create a counter.yaml file with the following content to create a test application:
+apiVersion: v1
+kind: Pod
+metadata:
+ name: counter
+ labels:
+ logging: "true" # Only logs of pods with this label are collected.
+spec:
+ containers:
+ - name: count
+ image: busybox
+ args: [/bin/sh, -c,
+ 'i=0; while true; do echo "$i: $(date)"; i=$((i+1)); sleep 1; done']
+Use kubectl to deploy the pod and verify its status.
+kubectl create -f counter.yaml
+kubectl get pods
+
+Navigate to the Kibana dashboard and click Stack Monitoring in the left navigation bar.
+
+On the Stack Monitoring page, click Or, set up with self monitoring.
+
+
+Click Turn on monitoring and wait for approximately 10 seconds. When a dialog box
+appears, click OK to confirm.
+
+In the left navigation bar, click Stack Management at the bottom.
+
+Choose Kibana > Index Patterns > Create index pattern.
+
+Create an index pattern using the following parameters:
+⚫ Name: k8s-*
+⚫ Timestamp field: @timestamp
+
+
+Note: The k8s index prefix is defined in the Fluentd ConfigMap.
+ output.conf: |-
+ <match **>
+ @id elasticsearch
+ @type elasticsearch
+ @log_level info
+ include_tag_key true
+ host elasticsearch
+ port 9200
+ logstash_format true
+ logstash_prefix k8s # Sets the index prefix to "k8s".
+ request_timeout 30s
+
+
+
+Click Discover in the left navigation bar. You should see the logs collected by Fluentd and
+visualized by Kibana through Elasticsearch.
+
+Note: If there are numerous log entries, use the Add filter option at the top left to refine
+your search. Since this example uses a single counter pod, filtering is not necessary.
+
+Return to the CLI and delete the test application.
+kubectl delete -f counter.yaml
+kubectl get pods
+
+
+
+
+
+
