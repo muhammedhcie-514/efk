@@ -1,0 +1,146 @@
+Step 1 Create an es directory for storing related files.
+mkdir es 
+ls
+
+
+Step 2 Create the service.
+Create an elasticsearch-svc.yaml file with the following content:
+kind: Service
+apiVersion: v1
+metadata:
+ name: elasticsearch
+ namespace: logging
+ labels:
+ app: elasticsearch
+spec:
+ selector:
+ app: elasticsearch
+ clusterIP: None
+ ports:
+ - port: 9200
+ name: rest
+ - port: 9300
+ name: inter-node
+
+
+Use kubectl to create the service resource object.
+kubectl create -f elasticsearch-svc.yaml
+kubectl get services -n logging
+
+
+Step 3 Deploy Elasticsearch.
+Create an elasticsearch-statefulset.yaml file with the following content:
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+ name: es
+ namespace: logging
+spec:
+ serviceName: elasticsearch
+ replicas: 3
+ selector:
+matchLabels:
+ app: elasticsearch
+ template:
+ metadata:
+ labels:
+ app: elasticsearch
+ spec:
+ initContainers:
+ - name: increase-vm-max-map
+ image: busybox
+ imagePullPolicy: "IfNotPresent"
+ command: ["sysctl", "-w", "vm.max_map_count=262144"]
+ securityContext:
+ privileged: true
+ - name: increase-fd-ulimit
+ image: busybox
+ command: ["sh", "-c", "ulimit -n 65536"]
+ securityContext:
+ privileged: true
+ - name: fix-permissions
+ image: busybox
+ imagePullPolicy: "IfNotPresent"
+ securityContext:
+ privileged: true
+ command: ["sh", "-c", "chown -R 1000:1000 /usr/share/elasticsearch/data"]
+ volumeMounts:
+ - name: data
+ mountPath: /usr/share/elasticsearch/data
+ containers:
+ - name: elasticsearch
+ image: swr.cn-east-3.myhuaweicloud.com/hcie_openeuler/elasticsearch:7.17.1
+ imagePullPolicy: "IfNotPresent"
+ ports:
+ - name: rest
+ containerPort: 9200
+ - name: inter
+ containerPort: 9300
+ resources:
+ limits:
+ cpu: 1000m
+ requests:
+ cpu: 1000m
+ volumeMounts:
+ - name: data
+ mountPath: /usr/share/elasticsearch/data
+ env:
+ - name: cluster.name
+ value: k8s-logs
+- name: node.name
+ valueFrom:
+ fieldRef:
+ fieldPath: metadata.name
+ - name: cluster.initial_master_nodes
+ value: "es-0,es-1,es-2"
+ - name: discovery.zen.minimum_master_nodes
+ value: "2"
+ - name: discovery.seed_hosts
+ value: "elasticsearch"
+ - name: ES_JAVA_OPTS
+ value: "-Xms512m -Xmx512m"
+ - name: network.host
+ value: "0.0.0.0"
+ volumeClaimTemplates:
+ - metadata:
+ name: data
+ labels:
+ app: elasticsearch
+ spec:
+ accessModes: [ "ReadWriteOnce" ]
+ storageClassName: efk-sc
+ resources:
+ requests:
+ storage: 10Gi
+
+
+Use kubectl to deploy Elasticsearch and wait until the deployment is complete.
+kubectl create -f elasticsearch-statefulset.yaml
+kubectl get sts -n logging
+kubectl get pods -n logging
+kubectl get svc -n logging
+
+Note: Wait until the StatefulSet and pods show a Running status before proceeding to
+the next step
+
+
+Step 4 Test the deployment.
+Send a request to the RESTful API to check whether the Elasticsearch cluster is running
+properly. Set up a forwarding tunnel.
+kubectl port-forward es-0 9200:9200 --namespace=logging
+
+
+
+Open a new terminal and log in to the master node.
+Send a request to the RESTful API of the Elasticsearch cluster and save the output to
+a .txt file.
+curl -o test.txt http://localhost:9200/_cluster/state?pretty
+
+View the test.txt file. It should contain information about the three Elasticsearch cluster
+nodes.
+
+
+
+
+
+
