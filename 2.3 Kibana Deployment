@@ -1,0 +1,109 @@
+Step 1 Create a directory for storing Kibana YAML files.
+
+mkdir kibana
+cd kibaka
+pwd
+
+
+Step 2 Deploy Kibana.
+Create a kibana.yaml file with the following content:
+apiVersion: v1
+kind: ConfigMap
+metadata:
+ namespace: logging
+ name: kibana-config
+ labels:
+ app: kibana
+data:
+ kibana.yml: |
+ server.name: kibana
+ server.host: "0.0.0.0"
+ i18n.locale: en 
+elasticsearch:
+ hosts: ${ELASTICSEARCH_HOSTS} # Elasticsearch cluster connection address
+---
+apiVersion: v1
+kind: Service
+metadata:
+ name: kibana
+ namespace: logging
+ labels:
+ app: kibana
+spec:
+ ports:
+ - port: 5601
+ type: NodePort
+ selector:
+ app: kibana
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+ name: kibana
+ namespace: logging
+ labels:
+ app: kibana
+spec:
+ selector:
+ matchLabels:
+ app: kibana
+ template:
+ metadata:
+ labels:
+ app: kibana
+ spec:
+ nodeSelector:
+ app: service
+ containers:
+ - name: kibana
+ image: swr.cn-east-3.myhuaweicloud.com/hcie_openeuler/kibana:7.17.1
+ imagePullPolicy: "IfNotPresent"
+ resources:
+ limits:
+ cpu: 1000m
+ requests:
+ cpu: 1000m
+ env:
+ - name: ELASTICSEARCH_URL
+ value: http://elasticsearch:9200 # Elasticsearch headless service name
+- name: ELASTICSEARCH_HOSTS
+ value: http://elasticsearch:9200 # Elasticsearch headless service name
+ ports:
+ - containerPort: 5601
+ volumeMounts:
+ - name: config
+ mountPath: /usr/share/kibana/config/kibana.yml # Kibana configuration file mount path
+ readOnly: true
+ subPath: kibana.yml
+ volumes:
+ - name: config # Match the name in "volumeMounts."
+ configMap:
+ name: kibana-config
+
+
+Note: A headless service has been created when Elasticsearch is deployed. The name of
+the service can be used to connect Kibana to Elasticsearch. The DNS in the Kubernetes
+cluster automatically resolves the address
+kubectl get svc -n logging
+
+Use kubectl to create Kibana resources and view the resources.
+kubectl create -f kibana.yaml
+kubectl get pods --namespace=logging
+kubectl get svc -n logging
+
+Wait for 10 to 20 seconds until the Kibana pod shows a Running status.
+
+
+Step 3 Test the deployment.
+Access Kibana through the NodePort assigned to the service. Open
+http://<EIP_of_any_node>:31298 in a browser.
+
+
+
+Note:
+1. The Kubernetes nodes need an EIP for external access.
+2. Port 31298 is randomly assigned by Kibana. Replace it with the actual one.
+3. Add the NodePort assigned by Kibana to the inbound rules of the security group.
+4. Upon first access, Kibana will not have any Integrations configured. Click Explore on
+my own to proceed to the homepage.
+
